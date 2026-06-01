@@ -1,8 +1,8 @@
 import sys
 import os
 import pandas as pd
-import numpy as np
 import streamlit as st
+import itertools
 
 # Configuración de la interfaz gráfica
 st.set_page_config(
@@ -20,6 +20,7 @@ from src.models.jaccard import JaccardIR
 from src.models.tfidf import TfidfIR
 from src.models.bm25 import BM25IR
 from src.evaluator import Evaluator
+from src.qrels import QrelsManager  # Importamos tu nueva clase gestora
 
 try:
     from src.models.embeddings import EmbeddingsIR
@@ -33,44 +34,6 @@ except ImportError:
             return [("Document_2", 0.8921), ("Document_12", 0.8415), ("Document_5", 0.7962), ("Document_20", 0.7120)][:k]
 
 # ==========================================
-# FUNCIONES AUXILIARES DE EVALUACIÓN (POOLING)
-# ==========================================
-def generar_qrels_por_modelos(modelos_dict, queries_dict, k_pool=3):
-    qrels_detallado = {}
-    for q_id, q_text in queries_dict.items():
-        qrels_detallado[q_id] = {}
-        for nombre, modelo in modelos_dict.items():
-            resultados = modelo.search(q_text, k=k_pool)
-            docs_recuperados = [doc_id for doc_id, _ in resultados]
-            qrels_detallado[q_id][nombre] = docs_recuperados
-    return qrels_detallado
-
-def aplanar_qrels_para_evaluador(qrels_detallado):
-    qrels_plano = {}
-    for q_id, modelos_docs in qrels_detallado.items():
-        documentos_unicos = set()
-        for docs in modelos_docs.values():
-            documentos_unicos.update(docs)
-        qrels_plano[q_id] = list(documentos_unicos)
-    return qrels_plano
-
-def qrels_a_dataframe_comparativo(qrels_detallado, queries_dict):
-    filas = []
-    for q_id, modelos_docs in qrels_detallado.items():
-        q_text = queries_dict.get(q_id, "Consulta no encontrada")
-        max_k = max(len(docs) for docs in modelos_docs.values()) if modelos_docs else 0
-        
-        for i in range(max_k):
-            fila = {"Query ID": q_id, "Consulta": q_text, "Rank": i + 1}
-            for nombre_modelo, lista_docs in modelos_docs.items():
-                if i < len(lista_docs):
-                    fila[nombre_modelo] = lista_docs[i]
-                else:
-                    fila[nombre_modelo] = "N/A"
-            filas.append(fila)
-    return pd.DataFrame(filas)
-
-# ==========================================
 # CARGA DEL SISTEMA Y CACHÉ
 # ==========================================
 @st.cache_resource
@@ -81,8 +44,15 @@ def inicializar_sistema():
         st.stop()
         
     df = pd.read_csv(ruta_csv)
+    # Eliminamos nulos en texto y reseteamos índice para alinear IDs
+    df = df.dropna(subset=['text']).reset_index(drop=True)
     df['doc_id'] = [f"Document_{i}" for i in range(len(df))]
-    df['text'] = df['text'].fillna("")
+    
+    # Aseguramos la existencia de la columna categoría (topics en Reuters)
+    if 'topics' in df.columns:
+        df['categoria'] = df['topics'].fillna("")
+    else:
+        df['categoria'] = ""
 
     preprocessor = TextPreprocessor(language='english')
     df['text_clean'] = df['text'].apply(preprocessor.transform)
@@ -93,7 +63,14 @@ def inicializar_sistema():
     jaccard = JaccardIR(preprocessor, indexer); jaccard.index()
     tfidf = TfidfIR(preprocessor, indexer); tfidf.index()
     bm25 = BM25IR(preprocessor, indexer); bm25.index()
-    embeddings = EmbeddingsIR(preprocessor, indexer); embeddings.index()
+    
+    # Asumiendo que tu EmbeddingsIR original toma el dataframe y columnas específicas
+    try:
+        embeddings = EmbeddingsIR(df, text_column='text_clean', id_column='doc_id')
+    except TypeError:
+        embeddings = EmbeddingsIR(preprocessor, indexer)
+        
+    embeddings.index()
 
     return df, jaccard, tfidf, bm25, embeddings
 
@@ -113,6 +90,13 @@ queries_prueba = {
     "Q10": "sugar production, cane refining and global trade quotas"
 }
 
+# Mapeo exacto para extraer el Terreno de Verdad (Ground Truth)
+mapeo_consultas_categorias = {
+    "Q01": "crude", "Q02": "earn", "Q03": "grain", "Q04": "interest",
+    "Q05": "trade", "Q06": "gold", "Q07": "coffee", "Q08": "cpi",
+    "Q09": "acq", "Q10": "sugar"
+}
+
 def renderizar_tabla_top4(resultados, df, k=4):
     if not resultados:
         st.warning("No se recuperaron documentos para esta consulta.")
@@ -122,7 +106,7 @@ def renderizar_tabla_top4(resultados, df, k=4):
     for rank, (doc_id, score) in enumerate(resultados[:k], 1):
         fila_doc = df.loc[df['doc_id'] == doc_id]
         if not fila_doc.empty:
-            snippet = fila_doc['text'].values[0][:180].replace("\n", " ") + "..."
+            snippet = str(fila_doc['text'].values[0])[:180].replace("\n", " ") + "..."
         else:
             snippet = "[Contenido no encontrado]"
             
@@ -180,14 +164,15 @@ with tab_embeddings:
 # --- PESTAÑA 5: COMPARATIVA Y EVALUACIÓN ---
 with tab_comparativa:
     st.header("Análisis Comparativo y Banco de Pruebas")
-    st.write("Ejecución automatizada de las 10 consultas predefinidas utilizando Pooling para la generación de terreno de verdad (Ground Truth).")
+    st.write("Ejecución automatizada de las 10 consultas predefinidas evaluadas contra las categorías etiquetadas del dataset Reuters.")
     
     with st.expander("👁️ Ver las 10 Consultas de Prueba configuradas"):
         st.json(queries_prueba)
         
     if st.button("🚀 Ejecutar Benchmark del Sistema (10 Consultas)"):
-        with st.spinner("Procesando matrices de relevancia y agrupando resultados..."):
+        with st.spinner("Evaluando modelos y calculando métricas de rendimiento..."):
             
+            k_eval = 5
             modelos_dict = {
                 "Jaccard (Binario)": mod_jaccard,
                 "TF-IDF (Coseno)": mod_tfidf,
@@ -195,42 +180,84 @@ with tab_comparativa:
                 "Semántico (Embeddings)": mod_embeddings
             }
             
-            # 1. Generación de Qrels dinámicos mediante Pooling
-            qrels_detallado = generar_qrels_por_modelos(modelos_dict, queries_prueba, k_pool=3)
-            qrels_plano = aplanar_qrels_para_evaluador(qrels_detallado)
+            # 1. Instanciar Gestor y Obtener Qrels Reales (Ground Truth)
+            gestor_qrels = QrelsManager(modelos_dict, queries_prueba)
+            qrels_reales = gestor_qrels.generar_ground_truth_desde_corpus(df_corpus, mapeo_consultas_categorias)
             
-            # 2. Inicialización del Evaluador
-            evaluador = Evaluator(qrels_plano)
+            # 2. Obtener los documentos recuperados por los modelos (para gráfico de solapamiento)
+            qrels_recuperados = gestor_qrels.generar_qrels_por_modelos(k_pool=k_eval)
+            df_comparativa_documentos = gestor_qrels.a_dataframe_comparativo()
             
-            # 3. Evaluación matemática del sistema
-            df_map_global, df_metricas_detalle = evaluador.evaluar_modelos(modelos_dict, queries_prueba, k=5)
+            # 3. Inicializar Evaluador y calcular métricas
+            evaluador = Evaluator(qrels_reales)
+            df_map_global, _ = evaluador.evaluar_modelos(modelos_dict, queries_prueba, k=k_eval)
             df_map_global["MAP"] = df_map_global["MAP"].round(4)
             
-            # 4. Estructuración del Pooling Comparativo
-            df_comparativa_documentos = qrels_a_dataframe_comparativo(qrels_detallado, queries_prueba)
+            # 4. Calcular promedios de Precision y Recall
+            filas_metricas_agregadas = []
+            for nombre_modelo, modelo in modelos_dict.items():
+                precisiones, recalls = [], []
+                for q_id, q_text in queries_prueba.items():
+                    resultados = modelo.search(q_text, k=k_eval)
+                    p, r = evaluador.precision_recall(resultados, q_id)
+                    precisiones.append(p)
+                    recalls.append(r)
+                
+                avg_precision = sum(precisiones) / len(precisiones) if precisiones else 0
+                avg_recall = sum(recalls) / len(recalls) if recalls else 0
+                
+                filas_metricas_agregadas.append({
+                    "Modelo": nombre_modelo,
+                    f"Precision@{k_eval}": round(avg_precision, 4),
+                    f"Recall@{k_eval}": round(avg_recall, 4)
+                })
+
+            df_metricas_agregadas = pd.DataFrame(filas_metricas_agregadas)
+            df_resumen_total = pd.merge(df_map_global, df_metricas_agregadas, on="Modelo")
+            
+            # 5. Calcular Matriz de Coincidencias (Overlap Matrix)
+            nombres_modelos = list(modelos_dict.keys())
+            co_matrix = pd.DataFrame(0, index=nombres_modelos, columns=nombres_modelos)
+            
+            for q_id, modelos_docs in qrels_recuperados.items():
+                for m1, m2 in itertools.combinations(nombres_modelos, 2):
+                    # Intersección de documentos en el top K entre m1 y m2
+                    interseccion = len(set(modelos_docs[m1]).intersection(set(modelos_docs[m2])))
+                    co_matrix.loc[m1, m2] += interseccion
+                    co_matrix.loc[m2, m1] += interseccion
+            
+            # Llenar la diagonal con el total de documentos recuperados por sí mismo
+            for m in nombres_modelos:
+                co_matrix.loc[m, m] = sum(len(set(docs[m])) for docs in qrels_recuperados.values())
             
             # --- RENDERIZADO VISUAL ---
             st.markdown("---")
-            st.subheader("1. Métrica Global del Sistema (MAP)")
+            st.subheader("1. Rendimiento Global del Sistema (Promedios Macro)")
             
-            col_graf, col_tabla = st.columns([2, 1.5])
-            with col_graf:
-                st.bar_chart(data=df_map_global.set_index("Modelo"), y="MAP", color="#1f77b4")
-            with col_tabla:
-                st.dataframe(df_map_global, use_container_width=True, hide_index=True)
-                
-            st.markdown("---")
-            st.subheader("2. Desglose Detallado de Precisión y Recall por Consulta (k=5)")
-            st.dataframe(df_metricas_detalle, use_container_width=True, hide_index=True)
+            col_graf_map, col_tabla_resumen = st.columns([1.5, 2.5])
+            with col_graf_map:
+                st.bar_chart(data=df_resumen_total.set_index("Modelo"), y="MAP", color="#1f77b4")
+            with col_tabla_resumen:
+                st.dataframe(df_resumen_total, use_container_width=True, hide_index=True)
             
             st.markdown("---")
-            st.subheader("3. Alineación de Documentos Recuperados (Top 3 Pooling)")
-            st.write("Identificación visual de intersecciones y divergencias entre arquitecturas léxicas y semánticas.")
-            st.dataframe(df_comparativa_documentos, use_container_width=True, hide_index=True)
+            st.subheader(f"2. Matriz de Coincidencias (Solapamiento en Top {k_eval})")
+            st.write("Muestra la cantidad de documentos idénticos recuperados en conjunto por dos modelos a través de las 10 consultas. Valores más altos indican mayor consenso entre los algoritmos.")
+            
+            # Usamos background_gradient para generar un Heatmap nativo en Streamlit
+            st.dataframe(
+                co_matrix.style.background_gradient(cmap='Blues', axis=None), 
+                use_container_width=True
+            )
+            
+            st.markdown("---")
+            with st.expander("🔍 Ver Alineación detallada de Documentos Recuperados (Ranking)"):
+                st.write("Identificación visual de intersecciones y divergencias específicas por cada posición de recuperación.")
+                st.dataframe(df_comparativa_documentos, use_container_width=True, hide_index=True)
 
     # Análisis Cualitativo
     st.markdown("---")
-    st.subheader("📝 Directrices de Análisis e Informe Técnico (Requerimiento f)")
+    st.subheader("📝 Directrices de Análisis e Informe Técnico")
     
     col_analisis_1, col_analisis_2 = st.columns(2)
     with col_analisis_1:
