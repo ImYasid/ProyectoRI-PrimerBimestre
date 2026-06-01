@@ -27,15 +27,30 @@ class Evaluator:
         return sum(aps) / len(aps) if aps else 0.0
 
     def evaluar_modelos(self, modelos_dict, queries_prueba, k=5):
-        resumen = []
+        resumen_map = []
+        detalles_consultas = [] # Lista para guardar el detalle P y R
+
         for nombre, modelo in modelos_dict.items():
             resultados_globales = {}
             for q_id, q_text in queries_prueba.items():
                 resultados = modelo.search(q_text, k=k)
                 resultados_globales[q_id] = resultados
+                
                 p, r = self.precision_recall(resultados, q_id)
-                print(f"[{nombre}] '{q_text}': P={p:.2f} R={r:.2f}")
+                
+                # Guardamos el detalle en vez de imprimirlo
+                detalles_consultas.append({
+                    "Modelo": nombre,
+                    "Query ID": q_id,
+                    "Texto": q_text,
+                    "Precision": round(p, 2),
+                    "Recall": round(r, 2)
+                })
+                
             map_val = self.map_score(resultados_globales)
-            print(f"MAP {nombre}: {map_val:.4f}\n")
-            resumen.append({"Modelo": nombre, "MAP": map_val})
-        return pd.DataFrame(resumen).sort_values("MAP", ascending=False).reset_index(drop=True)
+            resumen_map.append({"Modelo": nombre, "MAP": round(map_val, 4)})
+            
+        df_map = pd.DataFrame(resumen_map).sort_values("MAP", ascending=False).reset_index(drop=True)
+        df_detalles = pd.DataFrame(detalles_consultas)
+        
+        return df_map, df_detalles
